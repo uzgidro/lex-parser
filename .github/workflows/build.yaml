@@ -44,21 +44,35 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Setup SSH
+      - name: Setup SSH agent
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.GITOPS_SSH_KEY }}
+
+      - name: Update dev manifest
         run: |
+          # Настройка git
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Добавляем GitHub в known_hosts
           mkdir -p ~/.ssh
-          echo "${{ secrets.GITOPS_SSH_KEY }}" > ~/.ssh/id_ed25519
-          chmod 600 ~/.ssh/id_ed25519
           ssh-keyscan github.com >> ~/.ssh/known_hosts
 
-      - name: Update dev
-        run: |
+          # Клонируем gitops репо
           git clone git@github.com:${{ github.repository_owner }}/GitOps-Repo.git gitops
+
+          # Переходим в склонированную папку
           cd gitops
-          kustomize edit set image lex-parser=${{ env.DOCKER_IMAGE }}:${{ github.sha }}
-          cd ../..
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add .
-          git diff --staged --quiet || git commit -m "deploy(dev): ${{ github.sha }}"
-          git push
+
+          # Обновляем image tag через sed
+          sed -i "s|newTag:.*|newTag: ${{ github.sha }}|g" apps/lex-parser/overlays/dev/kustomization.yaml
+
+          # Коммит и пуш если есть изменения
+          if [[ -n $(git status --porcelain) ]]; then
+            git add apps/lex-parser/overlays/dev/kustomization.yaml
+            git commit -m "deploy(dev): ${{ github.sha }}"
+            git push
+          else
+            echo "No changes to commit"
+          fi
