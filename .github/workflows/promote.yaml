@@ -22,24 +22,36 @@ jobs:
           docker manifest inspect ${{ env.DOCKER_IMAGE }}:${{ inputs.image_tag }} || \
             (echo "Image not found!" && exit 1)
 
-      - name: Setup SSH
-        run: |
-          mkdir -p ~/.ssh
-          echo "${{ secrets.GITOPS_SSH_KEY }}" > ~/.ssh/id_ed25519
-          chmod 600 ~/.ssh/id_ed25519
-          ssh-keyscan github.com >> ~/.ssh/known_hosts
+      - name: Setup SSH agent
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.GITOPS_SSH_KEY }}
 
       - name: Promote to prod
         run: |
-          git clone git@github.com:${{ github.repository_owner }}/lex-parser-gitops.git gitops
-          cd gitops/overlays/prod
-          kustomize edit set image lex-parser=${{ env.DOCKER_IMAGE }}:${{ inputs.image_tag }}
-          cd ../..
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add .
-          git diff --staged --quiet || git commit -m "deploy(prod): ${{ inputs.image_tag }}"
-          git push
+          # Настройка git
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Добавляем GitHub в known_hosts
+          mkdir -p ~/.ssh
+          ssh-keyscan github.com >> ~/.ssh/known_hosts
+
+          # Клонируем gitops репо
+          git clone git@github.com:${{ github.repository_owner }}/GitOps-Repo.git gitops
+          cd gitops
+
+          # Обновляем image tag через sed
+          sed -i "s|newTag:.*|newTag: ${{ inputs.image_tag }}|g" apps/lex-parser/overlays/prod/kustomization.yaml
+
+          # Коммит и пуш если есть изменения
+          if [[ -n $(git status --porcelain) ]]; then
+            git add apps/lex-parser/overlays/prod/kustomization.yaml
+            git commit -m "deploy(prod): ${{ inputs.image_tag }}"
+            git push
+          else
+            echo "No changes to commit"
+          fi
 
       - name: Tag as stable
         run: |
