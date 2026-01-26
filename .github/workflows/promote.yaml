@@ -1,0 +1,49 @@
+name: Promote to Prod
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'Image tag to promote (SHA from dev)'
+        required: true
+        type: string
+
+env:
+  DOCKER_IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/lex-parser
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    environment: production  # Требует approval в GitHub
+
+    steps:
+      - name: Verify image exists
+        run: |
+          docker manifest inspect ${{ env.DOCKER_IMAGE }}:${{ inputs.image_tag }} || \
+            (echo "Image not found!" && exit 1)
+
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.GITOPS_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan github.com >> ~/.ssh/known_hosts
+
+      - name: Promote to prod
+        run: |
+          git clone git@github.com:${{ github.repository_owner }}/lex-parser-gitops.git gitops
+          cd gitops/overlays/prod
+          kustomize edit set image lex-parser=${{ env.DOCKER_IMAGE }}:${{ inputs.image_tag }}
+          cd ../..
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .
+          git diff --staged --quiet || git commit -m "deploy(prod): ${{ inputs.image_tag }}"
+          git push
+
+      - name: Tag as stable
+        run: |
+          echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login -u ${{ secrets.DOCKERHUB_USERNAME }} --password-stdin
+          docker pull ${{ env.DOCKER_IMAGE }}:${{ inputs.image_tag }}
+          docker tag ${{ env.DOCKER_IMAGE }}:${{ inputs.image_tag }} ${{ env.DOCKER_IMAGE }}:stable
+          docker push ${{ env.DOCKER_IMAGE }}:stable
