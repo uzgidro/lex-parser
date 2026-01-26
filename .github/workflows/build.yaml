@@ -66,11 +66,11 @@ jobs:
           cd gitops
 
           # Обновляем image tag через sed
-          sed -i "s|newTag:.*|newTag: ${{ github.sha }}|g" apps/lex-parser/overlays/dev/kustomization.yaml
+          sed -i "s|newTag:.*|newTag: ${{ github.sha }}|g" apps/lex-parser-gitops/overlays/dev/kustomization.yaml
 
           # Коммит и пуш если есть изменения
           if [[ -n $(git status --porcelain) ]]; then
-            git add apps/lex-parser/overlays/dev/kustomization.yaml
+            git add apps/lex-parser-gitops/overlays/dev/kustomization.yaml
             git commit -m "deploy(dev): ${{ github.sha }}"
             git push
           else
