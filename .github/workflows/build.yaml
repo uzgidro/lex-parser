@@ -54,7 +54,7 @@ jobs:
       - name: Update dev
         run: |
           git clone git@github.com:${{ github.repository_owner }}/GitOps-Repo.git gitops
-          cd apps/lex-parser-gitops/overlays/dev
+          cd /apps/lex-parser-gitops/overlays/dev
           kustomize edit set image lex-parser=${{ env.DOCKER_IMAGE }}:${{ github.sha }}
           cd ../..
           git config user.name "github-actions[bot]"
