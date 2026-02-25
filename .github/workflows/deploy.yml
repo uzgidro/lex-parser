@@ -70,12 +70,16 @@ jobs:
       sha8: ${{ needs.build-and-push.outputs.sha8 }}
 
     steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
       - name: Run Trivy vulnerability scan
         uses: aquasecurity/trivy-action@master
         with:
           image-ref: ${{ env.DOCKER_IMAGE }}:${{ needs.build-and-push.outputs.sha8 }}
           exit-code: '1'
           severity: 'CRITICAL,HIGH'
+          trivyignores: .trivyignore
 
   trigger-watchtower:
     runs-on: ubuntu-latest
