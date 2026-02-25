@@ -1,3 +1,5 @@
 /.idea/
 /.claude/
 /.venv/
+lex-parser/
+docs/
