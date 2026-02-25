@@ -1,0 +1,99 @@
+name: CI/CD Build and Deploy
+
+on:
+  push:
+    branches: [main, master]
+
+env:
+  DOCKER_IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/lex-parser
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    outputs:
+      sha8: ${{ steps.slug.outputs.sha8 }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Get Short SHA
+        id: slug
+        run: echo "sha8=$(echo ${GITHUB_SHA} | cut -c1-7)" >> $GITHUB_OUTPUT
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          push: true
+          pull: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          tags: |
+            ${{ env.DOCKER_IMAGE }}:latest
+            ${{ env.DOCKER_IMAGE }}:${{ steps.slug.outputs.sha8 }}
+
+  verify-image:
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    outputs:
+      sha8: ${{ needs.build-and-push.outputs.sha8 }}
+
+    steps:
+      - name: Run Trivy vulnerability scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.DOCKER_IMAGE }}:${{ needs.build-and-push.outputs.sha8 }}
+          exit-code: '1'
+          severity: 'CRITICAL,HIGH'
+
+  trigger-watchtower:
+    runs-on: ubuntu-latest
+    needs: verify-image
+
+    steps:
+      - name: Trigger Watchtower Update
+        run: |
+          curl -sf -H "Authorization: Bearer ${{ secrets.WATCHTOWER_SECRET }}" \
+            https://${{ secrets.WATCHTOWER_HOST }}/v1/update
+
+  update-k8s-manifest:
+    runs-on: ubuntu-latest
+    needs: verify-image
+
+    steps:
+      - name: Setup SSH
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.GITOPS_SSH_KEY }}
+
+      - name: Update and Push Manifest
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+          mkdir -p ~/.ssh
+          ssh-keyscan github.com >> ~/.ssh/known_hosts
+
+          git clone git@github.com:${{ github.repository_owner }}/GitOps-Repo.git temp-repo
+          cd temp-repo
+
+          sed -i "s|newTag:.*|newTag: ${{ needs.verify-image.outputs.sha8 }}|g" apps/lex-parser/overlays/dev/kustomization.yaml
+
+          if [[ -n $(git status --porcelain) ]]; then
+            git add apps/lex-parser/overlays/dev/kustomization.yaml
+            git commit -m "deploy(dev): lex-parser:${{ needs.verify-image.outputs.sha8 }}"
+            git push origin main
+          else
+            echo "No changes in manifest"
+          fi
