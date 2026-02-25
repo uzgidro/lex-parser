@@ -1,0 +1,8 @@
+.git
+.github
+.gitignore
+.dockerignore
+docs/
+gitops-repo-example/
+lex-parser/
+*.md

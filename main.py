@@ -1,13 +1,64 @@
-from fastapi import FastAPI, Query, HTTPException
+import logging
+from contextlib import asynccontextmanager
+from time import monotonic
+
+from fastapi import FastAPI, Query, HTTPException, Request
 import httpx
 from bs4 import BeautifulSoup
 from pydantic import BaseModel
 from urllib.parse import quote
 
+logger = logging.getLogger("lex-parser")
+
+BASE_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+}
+
+LEX_BASE_URL = "https://lex.uz"
+CACHE_TTL = 600  # 10 minutes
+
+
+class SearchCache:
+    def __init__(self, ttl: int = CACHE_TTL, max_size: int = 256):
+        self._cache: dict[str, tuple[float, SearchResponse]] = {}
+        self._ttl = ttl
+        self._max_size = max_size
+
+    def get(self, key: str) -> "SearchResponse | None":
+        if key in self._cache:
+            ts, value = self._cache[key]
+            if monotonic() - ts < self._ttl:
+                return value
+            del self._cache[key]
+        return None
+
+    def set(self, key: str, value: "SearchResponse") -> None:
+        if len(self._cache) >= self._max_size:
+            # evict oldest entry
+            oldest = min(self._cache, key=lambda k: self._cache[k][0])
+            del self._cache[oldest]
+        self._cache[key] = (monotonic(), value)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    app.state.client = httpx.AsyncClient(
+        follow_redirects=True,
+        limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+        timeout=30.0,
+    )
+    app.state.cache = SearchCache()
+    yield
+    await app.state.client.aclose()
+
+
 app = FastAPI(
     title="Lex.uz Search Proxy",
     description="Proxy API for searching documents on lex.uz",
-    version="1.0.0"
+    version="1.0.0",
+    lifespan=lifespan,
 )
 
 
@@ -84,7 +135,8 @@ def parse_documents(soup: BeautifulSoup) -> list[Document]:
         # Extract title and URL
         link = row.find("a", class_="lx_link")
         title = link.get_text(strip=True) if link else ""
-        doc_url = link.get("href", "") if link else ""
+        href = link.get("href", "") if link else ""
+        doc_url = f"{LEX_BASE_URL}{href}" if href and href.startswith("/") else href
 
         # Extract badge
         badge_span = row.find("span", class_="badge")
@@ -109,86 +161,98 @@ def parse_documents(soup: BeautifulSoup) -> list[Document]:
     return documents
 
 
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+
+
 @app.get("/search", response_model=SearchResponse)
 async def search(
+    request: Request,
     searchtitle: str = Query(..., description="Search query for document title"),
-    page: int = Query(1, ge=1, description="Page number (starting from 1)")
+    page: int = Query(1, ge=1, le=100, description="Page number (starting from 1)")
 ):
     """
     Search for documents on lex.uz by title with pagination support.
 
     Returns a list of documents matching the search query along with pagination info.
     """
-    base_url = f"https://lex.uz/ru/search/nat?searchtitle={quote(searchtitle)}"
+    cache_key = f"{searchtitle}:{page}"
+    cache: SearchCache = request.app.state.cache
 
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Content-Type": "application/x-www-form-urlencoded",
-    }
+    cached = cache.get(cache_key)
+    if cached is not None:
+        logger.debug("Cache hit: query=%r page=%d", searchtitle, page)
+        return cached
 
-    async with httpx.AsyncClient(follow_redirects=True) as client:
-        try:
-            # First, get the initial page to obtain ASP.NET form fields
-            initial_response = await client.get(base_url, headers=headers, timeout=30.0)
-            initial_response.raise_for_status()
+    search_url = f"{LEX_BASE_URL}/ru/search/nat?searchtitle={quote(searchtitle)}"
+    client: httpx.AsyncClient = request.app.state.client
 
-            soup = BeautifulSoup(initial_response.text, "lxml")
+    logger.info("Searching lex.uz: query=%r page=%d", searchtitle, page)
 
-            # If requesting page 1, just return the initial response
-            if page == 1:
-                documents = parse_documents(soup)
-                total_pages = get_total_pages(soup)
-                return SearchResponse(
-                    documents=documents,
-                    current_page=1,
-                    total_pages=total_pages
-                )
+    try:
+        initial_response = await client.get(search_url, headers=BASE_HEADERS)
+        initial_response.raise_for_status()
 
-            # For other pages, we need to do a POST with ViewState
-            asp_fields = extract_asp_fields(soup)
+        soup = BeautifulSoup(initial_response.text, "lxml")
 
-            if not asp_fields.get("__VIEWSTATE"):
-                raise HTTPException(status_code=500, detail="Could not extract ViewState from lex.uz")
-
-            # Build the POST data for pagination
-            # The EVENTTARGET format is: ucFoundActsControl$rptPaging$ctl{XX}$lbPaging
-            # where XX is the 0-padded page index (page 2 = ctl01, page 3 = ctl02, etc.)
-            page_index = str(page - 1).zfill(2)
-            event_target = f"ucFoundActsControl$rptPaging$ctl{page_index}$lbPaging"
-
-            post_data = {
-                "__EVENTTARGET": event_target,
-                "__EVENTARGUMENT": "",
-                "__VIEWSTATE": asp_fields.get("__VIEWSTATE", ""),
-                "__VIEWSTATEGENERATOR": asp_fields.get("__VIEWSTATEGENERATOR", ""),
-                "__EVENTVALIDATION": asp_fields.get("__EVENTVALIDATION", ""),
-            }
-
-            # Make the POST request
-            response = await client.post(
-                base_url,
-                data=post_data,
-                headers=headers,
-                timeout=30.0
-            )
-            response.raise_for_status()
-
-            soup = BeautifulSoup(response.text, "lxml")
+        if page == 1:
             documents = parse_documents(soup)
             total_pages = get_total_pages(soup)
-
-            return SearchResponse(
+            if not documents:
+                logger.warning("No documents found for query=%r", searchtitle)
+            result = SearchResponse(
                 documents=documents,
-                current_page=page,
+                current_page=1,
                 total_pages=total_pages
             )
+            cache.set(cache_key, result)
+            return result
 
-        except httpx.HTTPStatusError as e:
-            raise HTTPException(status_code=e.response.status_code, detail="Error fetching data from lex.uz")
-        except httpx.RequestError as e:
-            raise HTTPException(status_code=503, detail=f"Connection error: {str(e)}")
+        asp_fields = extract_asp_fields(soup)
+        del soup
+
+        if not asp_fields.get("__VIEWSTATE"):
+            logger.error("ViewState not found for query=%r", searchtitle)
+            raise HTTPException(status_code=500, detail="Could not extract ViewState from lex.uz")
+
+        page_index = str(page - 1).zfill(2)
+        event_target = f"ucFoundActsControl$rptPaging$ctl{page_index}$lbPaging"
+
+        post_data = {
+            "__EVENTTARGET": event_target,
+            "__EVENTARGUMENT": "",
+            "__VIEWSTATE": asp_fields.get("__VIEWSTATE", ""),
+            "__VIEWSTATEGENERATOR": asp_fields.get("__VIEWSTATEGENERATOR", ""),
+            "__EVENTVALIDATION": asp_fields.get("__EVENTVALIDATION", ""),
+        }
+        del asp_fields
+
+        response = await client.post(
+            search_url,
+            data=post_data,
+            headers=BASE_HEADERS,
+        )
+        response.raise_for_status()
+
+        soup = BeautifulSoup(response.text, "lxml")
+        documents = parse_documents(soup)
+        total_pages = get_total_pages(soup)
+
+        result = SearchResponse(
+            documents=documents,
+            current_page=page,
+            total_pages=total_pages
+        )
+        cache.set(cache_key, result)
+        return result
+
+    except httpx.HTTPStatusError as e:
+        logger.error("lex.uz returned %d for query=%r", e.response.status_code, searchtitle)
+        raise HTTPException(status_code=e.response.status_code, detail="Error fetching data from lex.uz")
+    except httpx.RequestError as e:
+        logger.error("Connection error to lex.uz: %s", e)
+        raise HTTPException(status_code=503, detail=f"Connection error: {str(e)}")
 
 
 if __name__ == "__main__":
