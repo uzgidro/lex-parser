@@ -1,10 +1,19 @@
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Query, HTTPException
+from fastapi import FastAPI, Query, HTTPException, Request
 import httpx
 from bs4 import BeautifulSoup
 from pydantic import BaseModel
 from urllib.parse import quote
+
+
+BASE_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+}
+
+LEX_BASE_URL = "https://lex.uz"
 
 
 @asynccontextmanager
@@ -99,7 +108,8 @@ def parse_documents(soup: BeautifulSoup) -> list[Document]:
         # Extract title and URL
         link = row.find("a", class_="lx_link")
         title = link.get_text(strip=True) if link else ""
-        doc_url = link.get("href", "") if link else ""
+        href = link.get("href", "") if link else ""
+        doc_url = f"{LEX_BASE_URL}{href}" if href and href.startswith("/") else href
 
         # Extract badge
         badge_span = row.find("span", class_="badge")
@@ -124,30 +134,29 @@ def parse_documents(soup: BeautifulSoup) -> list[Document]:
     return documents
 
 
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+
+
 @app.get("/search", response_model=SearchResponse)
 async def search(
+    request: Request,
     searchtitle: str = Query(..., description="Search query for document title"),
-    page: int = Query(1, ge=1, description="Page number (starting from 1)")
+    page: int = Query(1, ge=1, le=100, description="Page number (starting from 1)")
 ):
     """
     Search for documents on lex.uz by title with pagination support.
 
     Returns a list of documents matching the search query along with pagination info.
     """
-    base_url = f"https://lex.uz/ru/search/nat?searchtitle={quote(searchtitle)}"
+    search_url = f"{LEX_BASE_URL}/ru/search/nat?searchtitle={quote(searchtitle)}"
 
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Content-Type": "application/x-www-form-urlencoded",
-    }
-
-    client: httpx.AsyncClient = app.state.client
+    client: httpx.AsyncClient = request.app.state.client
 
     try:
         # First, get the initial page to obtain ASP.NET form fields
-        initial_response = await client.get(base_url, headers=headers)
+        initial_response = await client.get(search_url, headers=BASE_HEADERS)
         initial_response.raise_for_status()
 
         soup = BeautifulSoup(initial_response.text, "lxml")
@@ -186,9 +195,9 @@ async def search(
 
         # Make the POST request
         response = await client.post(
-            base_url,
+            search_url,
             data=post_data,
-            headers=headers,
+            headers=BASE_HEADERS,
         )
         response.raise_for_status()
 

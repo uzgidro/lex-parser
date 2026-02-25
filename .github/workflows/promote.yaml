@@ -53,9 +53,14 @@ jobs:
             echo "No changes to commit"
           fi
 
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
       - name: Tag as stable
         run: |
-          echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login -u ${{ secrets.DOCKERHUB_USERNAME }} --password-stdin
           docker pull ${{ env.DOCKER_IMAGE }}:${{ inputs.image_tag }}
           docker tag ${{ env.DOCKER_IMAGE }}:${{ inputs.image_tag }} ${{ env.DOCKER_IMAGE }}:stable
           docker push ${{ env.DOCKER_IMAGE }}:stable
