@@ -1,13 +1,28 @@
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, Query, HTTPException
 import httpx
 from bs4 import BeautifulSoup
 from pydantic import BaseModel
 from urllib.parse import quote
 
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    app.state.client = httpx.AsyncClient(
+        follow_redirects=True,
+        limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+        timeout=30.0,
+    )
+    yield
+    await app.state.client.aclose()
+
+
 app = FastAPI(
     title="Lex.uz Search Proxy",
     description="Proxy API for searching documents on lex.uz",
-    version="1.0.0"
+    version="1.0.0",
+    lifespan=lifespan,
 )
 
 
@@ -128,67 +143,69 @@ async def search(
         "Content-Type": "application/x-www-form-urlencoded",
     }
 
-    async with httpx.AsyncClient(follow_redirects=True) as client:
-        try:
-            # First, get the initial page to obtain ASP.NET form fields
-            initial_response = await client.get(base_url, headers=headers, timeout=30.0)
-            initial_response.raise_for_status()
+    client: httpx.AsyncClient = app.state.client
 
-            soup = BeautifulSoup(initial_response.text, "lxml")
+    try:
+        # First, get the initial page to obtain ASP.NET form fields
+        initial_response = await client.get(base_url, headers=headers)
+        initial_response.raise_for_status()
 
-            # If requesting page 1, just return the initial response
-            if page == 1:
-                documents = parse_documents(soup)
-                total_pages = get_total_pages(soup)
-                return SearchResponse(
-                    documents=documents,
-                    current_page=1,
-                    total_pages=total_pages
-                )
+        soup = BeautifulSoup(initial_response.text, "lxml")
 
-            # For other pages, we need to do a POST with ViewState
-            asp_fields = extract_asp_fields(soup)
-
-            if not asp_fields.get("__VIEWSTATE"):
-                raise HTTPException(status_code=500, detail="Could not extract ViewState from lex.uz")
-
-            # Build the POST data for pagination
-            # The EVENTTARGET format is: ucFoundActsControl$rptPaging$ctl{XX}$lbPaging
-            # where XX is the 0-padded page index (page 2 = ctl01, page 3 = ctl02, etc.)
-            page_index = str(page - 1).zfill(2)
-            event_target = f"ucFoundActsControl$rptPaging$ctl{page_index}$lbPaging"
-
-            post_data = {
-                "__EVENTTARGET": event_target,
-                "__EVENTARGUMENT": "",
-                "__VIEWSTATE": asp_fields.get("__VIEWSTATE", ""),
-                "__VIEWSTATEGENERATOR": asp_fields.get("__VIEWSTATEGENERATOR", ""),
-                "__EVENTVALIDATION": asp_fields.get("__EVENTVALIDATION", ""),
-            }
-
-            # Make the POST request
-            response = await client.post(
-                base_url,
-                data=post_data,
-                headers=headers,
-                timeout=30.0
-            )
-            response.raise_for_status()
-
-            soup = BeautifulSoup(response.text, "lxml")
+        # If requesting page 1, just return the initial response
+        if page == 1:
             documents = parse_documents(soup)
             total_pages = get_total_pages(soup)
-
             return SearchResponse(
                 documents=documents,
-                current_page=page,
+                current_page=1,
                 total_pages=total_pages
             )
 
-        except httpx.HTTPStatusError as e:
-            raise HTTPException(status_code=e.response.status_code, detail="Error fetching data from lex.uz")
-        except httpx.RequestError as e:
-            raise HTTPException(status_code=503, detail=f"Connection error: {str(e)}")
+        # For other pages, we need to do a POST with ViewState
+        asp_fields = extract_asp_fields(soup)
+        del soup  # free memory before second request
+
+        if not asp_fields.get("__VIEWSTATE"):
+            raise HTTPException(status_code=500, detail="Could not extract ViewState from lex.uz")
+
+        # Build the POST data for pagination
+        # The EVENTTARGET format is: ucFoundActsControl$rptPaging$ctl{XX}$lbPaging
+        # where XX is the 0-padded page index (page 2 = ctl01, page 3 = ctl02, etc.)
+        page_index = str(page - 1).zfill(2)
+        event_target = f"ucFoundActsControl$rptPaging$ctl{page_index}$lbPaging"
+
+        post_data = {
+            "__EVENTTARGET": event_target,
+            "__EVENTARGUMENT": "",
+            "__VIEWSTATE": asp_fields.get("__VIEWSTATE", ""),
+            "__VIEWSTATEGENERATOR": asp_fields.get("__VIEWSTATEGENERATOR", ""),
+            "__EVENTVALIDATION": asp_fields.get("__EVENTVALIDATION", ""),
+        }
+        del asp_fields
+
+        # Make the POST request
+        response = await client.post(
+            base_url,
+            data=post_data,
+            headers=headers,
+        )
+        response.raise_for_status()
+
+        soup = BeautifulSoup(response.text, "lxml")
+        documents = parse_documents(soup)
+        total_pages = get_total_pages(soup)
+
+        return SearchResponse(
+            documents=documents,
+            current_page=page,
+            total_pages=total_pages
+        )
+
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(status_code=e.response.status_code, detail="Error fetching data from lex.uz")
+    except httpx.RequestError as e:
+        raise HTTPException(status_code=503, detail=f"Connection error: {str(e)}")
 
 
 if __name__ == "__main__":

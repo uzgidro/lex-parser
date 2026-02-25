@@ -1,6 +1,6 @@
 # Dockerfile for Lex.uz Search Proxy API
 
-FROM python:3.14-slim
+FROM python:3.13-slim
 
 WORKDIR /app
 
